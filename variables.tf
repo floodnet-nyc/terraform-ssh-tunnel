@@ -36,3 +36,9 @@ variable "tunnel_check_sleep" {
   description = "extra time to wait for kubectl tunnel to connect"
   default = "0s"
 }
+
+variable "external" {
+  type = bool
+  description = "A flag to quickly disable the terraform managed tunnel to run it manually."
+  default = false
+}
