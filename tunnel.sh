@@ -1,85 +1,73 @@
 
 MPID="$1"
 ret=0
-
+TUNNEL_DEBUG=""
 #---
 
+if [ -n "$TUNNEL_DEBUG" ] ; then
+  exec 2>/tmp/t1; set -x; env >&2
+fi
+
+which jq &> /dev/null || echo "You must install jq" >&2
+
+# Parent process: This parses arguments and runs the tunnel inside a timeout block
+
 if [ -z "$MPID" ] ; then
-  if [ -n "$TUNNEL_DEBUG" ] ; then
-    exec 2>/tmp/t1
-    set -x
-    env >&2
-  fi
-
-  ABSPATH=$(cd "$(dirname "$0")"; pwd -P)
-
+  # parse arguments
   query="`dd 2>/dev/null`"
-  [ -n "$TUNNEL_DEBUG" ] && echo "query: <$query>" >&2
+  echo "query: <$query>" >&2
 
-  export TIMEOUT="`echo $query | sed -e 's/^.*\"timeout\": *\"//' -e 's/\".*$//g'`"
-  export SSH_CMD="`echo $query | sed -e 's/^.*\"ssh_cmd\": *\"//' -e 's/\",.*$//g' -e 's/\\\"/\"/g'`"
-  export LOCAL_HOST="`echo $query | sed -e 's/^.*\"local_host\": *\"//' -e 's/\".*$//g'`"
-  export LOCAL_PORT="`echo $query | sed -e 's/^.*\"local_port\": *\"//' -e 's/\".*$//g'`"
-  export TARGET_HOST="`echo $query | sed -e 's/^.*\"target_host\": *\"//' -e 's/\".*$//g'`"
-  export TARGET_PORT="`echo $query | sed -e 's/^.*\"target_port\": *\"//' -e 's/\".*$//g'`"
-  export GATEWAY_HOST="`echo $query | sed -e 's/^.*\"gateway_host\": *\"//' -e 's/\".*$//g'`"
-  export GATEWAY_PORT="`echo $query | sed -e 's/^.*\"gateway_port\": *\"//' -e 's/\".*$//g'`"
-  export GATEWAY_USER="`echo $query | sed -e 's/^.*\"gateway_user\": *\"//' -e 's/\".*$//g'`"
-  export SHELL_CMD="`echo $query | sed -e 's/^.*\"shell_cmd\": *\"//' -e 's/\",.*$//g' -e 's/\\\"/\"/g'`"
-  export SSH_TUNNEL_CHECK_SLEEP="`echo $query | sed -e 's/^.*\"ssh_tunnel_check_sleep\": *\"//' -e 's/\",.*$//g' -e 's/\\\"/\"/g'`"
-  export CREATE="`echo $query | sed -e 's/^.*\"create\": *\"//' -e 's/\",.*$//g' -e 's/\\\"/\"/g'`"
+  eval $(echo $query | jq -r '@sh "
+export TIMEOUT=\(.timeout)
+export KUBECTL_CMD=\(.kubectl_cmd)
+export RESOURCE=\(.resource)
+export LOCAL_PORT=\(.local_port)
+export TARGET_PORT=\(.target_port)
+export SHELL_CMD=\(.shell_cmd)
+export TUNNEL_CHECK_SLEEP=\(.tunnel_check_sleep)"')
 
-  if [ "X$CREATE" = X -o "X$GATEWAY_HOST" = X ] ; then
-    # No tunnel - connect directly to target host
-    do_tunnel=''
-    cnx_host="$TARGET_HOST"
-    cnx_port="$TARGET_PORT"
-  else
-    do_tunnel='y'
-    cnx_host="$LOCAL_HOST"
-    cnx_port="$LOCAL_PORT"
+echo ".timeout" $TIMEOUT >&2
+echo ".kubectl_cmd" $KUBECTL_CMD >&2
+echo ".resource" $RESOURCE >&2
+echo ".local_port" $LOCAL_PORT >&2
+echo ".target_port" $TARGET_PORT >&2
+echo ".shell_cmd" $SHELL_CMD >&2
+echo ".tunnel_check_sleep" $TUNNEL_CHECK_SLEEP >&2
+
+  # Send result to output
+  # TODO: get local port from kubectl port-forward output
+  jq -n --arg LOCAL_PORT "$LOCAL_PORT" '{"port":$LOCAL_PORT}'
+
+  # run port forward with timeout
+  p=`ps -p $PPID -o "ppid="`
+  clog=`mktemp`
+  nohup timeout $TIMEOUT $SHELL_CMD \
+      "$(cd "$(dirname "$0")"; pwd -P)/tunnel.sh" $p \
+      <&- >&- 2>$clog &
+  CPID=$!
+  # A little time for the SSH tunnel process to start or fail
+  sleep 3
+  # If the child process does not exist anymore after this delay, report failure
+  if ! ps -p $CPID >/dev/null 2>&1 ; then
+    echo "Child process ($CPID) failure - Aborting" >&2
+    echo "Child diagnostics:" >&2
+    cat $clog >&2
+    ret=1
   fi
-
-  echo "{ \"host\": \"$cnx_host\",  \"port\": \"$cnx_port\" }"
-
-  if [ -n "$do_tunnel" ] ; then
-    p=`ps -p $PPID -o "ppid="`
-    clog=`mktemp`
-    nohup timeout $TIMEOUT $SHELL_CMD "$ABSPATH/tunnel.sh" $p <&- >&- 2>$clog &
-    CPID=$!
-    # A little time for the SSH tunnel process to start or fail
-    sleep 3
-    # If the child process does not exist anymore after this delay, report failure
-    if ! ps -p $CPID >/dev/null 2>&1 ; then
-      echo "Child process ($CPID) failure - Aborting" >&2
-      echo "Child diagnostics follow:" >&2
-      cat $clog >&2
-      rm -f $clog
-      ret=1
-    fi
-    rm -f $clog
-  fi
-else
-  #------ Child
-  if [ -n "$TUNNEL_DEBUG" ] ; then
-    exec 2>/tmp/t2
-    set -x
-    env >&2
-  fi
-
-  gw="$GATEWAY_HOST"
-  [ "X$GATEWAY_USER" = X ] || gw="$GATEWAY_USER@$GATEWAY_HOST"
-
-  $SSH_CMD -N -L $LOCAL_HOST:$LOCAL_PORT:$TARGET_HOST:$TARGET_PORT -p $GATEWAY_PORT $gw &
+  rm -f $clog
+else  #------ Child
+  $KUBECTL_CMD port-forward $RESOURCE $LOCAL_PORT:$TARGET_PORT &
   CPID=$!
   
-  sleep $SSH_TUNNEL_CHECK_SLEEP
+  sleep $TUNNEL_CHECK_SLEEP
 
   while true ; do
+    # check if port-forward is still running
     if ! ps -p $CPID >/dev/null 2>&1 ; then
-      echo "SSH process ($CPID) failure - Aborting" >&2
+      echo "kubectl port-forward process ($CPID) failure - Aborting" >&2
       exit 1
     fi
+    # check if parent is still running
     ps -p $MPID >/dev/null 2>&1 || break
     sleep 1
   done

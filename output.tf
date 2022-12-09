@@ -1,11 +1,9 @@
-
-output "port" {
-  value = data.external.ssh_tunnel.result.port
+output "host" {
+  value = "localhost"
   description = "Port number to connect to"
 }
 
-output "host" {
-  value = data.external.ssh_tunnel.result.host
-  description = "Host to connect to"
+output "port" {
+  value = var.local_port
+  description = "Port number to connect to"
 }
-
